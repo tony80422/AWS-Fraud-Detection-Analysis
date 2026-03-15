@@ -1,19 +1,19 @@
 # AWS Fraud Detection Analysis
 
-A real-time fraud detection pipeline built on AWS, combining offline model training with live transaction stream inference, automated alerting, and interactive visualization.
+A real-time fraud detection pipeline built on AWS, combining offline XGBoost model training with live transaction stream inference, automated alerting, and interactive visualization.
 
 ---
 
-## Author
+## Authors
 
-**Mingyu Fan, Cheng-yang Lee, Wei-chen Wang** — Graduate Student, Informatics, Northeastern University  
+**Mingyu Fan, Cheng-yang Lee, Wei-chen Wang** — Graduate Students, Informatics, Northeastern University  
 Project Repository: [AWS-Fraud-Detection-Analysis](https://github.com/optimus889/AWS-Fraud-Detection-Analysis)
 
 ---
 
 ## Project Overview
 
-This project implements an end-to-end fraud detection system using AWS managed services. Transactions are streamed in real time through Kinesis, scored by a SageMaker-hosted XGBoost model via Lambda, and results are stored in S3 for analysis through Athena and QuickSight. CloudWatch monitors the pipeline and sends SNS alerts when fraud rates exceed defined thresholds.
+This project implements an end-to-end fraud detection system using AWS managed services. A synthetic transaction dataset is used to train an XGBoost classifier on SageMaker. Live transactions are then streamed through Kinesis, scored by the deployed SageMaker endpoint via Lambda, and prediction results are stored in S3 for querying through Athena and visualization in QuickSight. CloudWatch monitors the pipeline and triggers SNS alerts when the fraud rate exceeds a defined threshold.
 
 ---
 
@@ -22,33 +22,32 @@ This project implements an end-to-end fraud detection system using AWS managed s
 ### Offline Pipeline (Model Training)
 
 ```
-Ubuntu Local Machine
-    └── offline_transaction.py          # Generate synthetic transaction dataset
-        └── .csv → S3 (raw/)            # Upload raw data to S3
-            └── SageMaker XGBoost       # Train fraud detection model
-                └── SageMaker Endpoint  # Deploy model for real-time inference
+PS_20174392719_1491204439457_log.csv
+    └── S3 (raw/)
+        └── SageMaker XGBoost Training
+            └── SageMaker Endpoint
 ```
 
 ### Online Pipeline (Real-Time Inference)
 
 ```
 Ubuntu Local Machine
-    └── stream_transactions.py          # Simulate live transaction stream
-        └── Kinesis (fraud-stream)      # Ingest streaming data
-            └── Lambda (inference)      # Trigger inference on each record
-                └── SageMaker Endpoint  # InvokeEndpoint for fraud scoring
-                    └── S3 (predictions/) # Store prediction results
-                        └── Athena      # Query predictions with SQL
-                            └── QuickSight # Visualize fraud analytics dashboard
+    └── src/stream_transactions.py
+        └── Kinesis (fraud-stream)
+            └── Lambda (fraud_detection_lambda.py)
+                └── SageMaker Endpoint
+                    └── S3 (predictions/realtime/)
+                        └── Athena
+                            └── QuickSight
 ```
 
 ### Monitoring
 
 ```
 CloudWatch
-    ├── Logs     — Lambda execution logs, inference latency
-    ├── Metrics  — Fraud rate, stream throughput, endpoint invocations
-    └── Alarms   → SNS Alerts (triggered when fraud rate exceeds threshold)
+    ├── Logs     — Lambda execution logs, SageMaker inference latency
+    ├── Metrics  — Fraud rate, Kinesis stream throughput, endpoint invocations
+    └── Alarms   → SNS Topic (fraud-alert-topic)
 ```
 
 ---
@@ -58,23 +57,57 @@ CloudWatch
 | Service | Role |
 |---|---|
 | **Amazon Kinesis** | Real-time transaction data ingestion (`fraud-stream`) |
-| **AWS Lambda** | Serverless inference trigger on each Kinesis record |
-| **Amazon SageMaker** | XGBoost model training and hosted endpoint |
-| **Amazon S3** | Storage for raw data, predictions, processed files, models, and logs |
+| **AWS Lambda** | Batch inference trigger on each Kinesis shard record |
+| **Amazon SageMaker** | XGBoost model training (`ml.m5.large`) and hosted real-time endpoint |
+| **Amazon S3** | Storage for raw data, processed splits, model artifacts, and predictions |
 | **Amazon Athena** | SQL-based querying over S3 prediction results |
 | **Amazon QuickSight** | Interactive fraud analytics dashboard |
 | **Amazon CloudWatch** | Logs, metrics, and alarms for pipeline monitoring |
-| **Amazon SNS** | Alert notifications when fraud rate threshold is exceeded |
+| **Amazon SNS** | Alert notifications to `fraud-alert-topic` when fraud rate is exceeded |
+
+---
+
+## Model Details
+
+| Item | Value |
+|---|---|
+| **Algorithm** | SageMaker Built-in XGBoost 1.7-1 |
+| **Objective** | `binary:logistic` |
+| **Eval Metric** | AUC |
+| **Boosting Rounds** | 120 |
+| **Training Instance** | `ml.m5.large` |
+| **Inference Threshold** | 0.5 |
+| **Test Accuracy** | 0.9980 |
+| **Test Precision** | 0.9718 |
+| **Test Recall** | 0.9789 |
+| **Test F1-score** | 0.9753 |
+| **Test ROC-AUC** | 0.9992 |
+
+### Feature Vector (11 features, order-sensitive)
+
+| # | Feature | Type |
+|---|---|---|
+| 1 | `step` | int |
+| 2 | `amount` | float |
+| 3 | `oldbalanceOrg` | float |
+| 4 | `newbalanceOrig` | float |
+| 5 | `oldbalanceDest` | float |
+| 6 | `newbalanceDest` | float |
+| 7 | `type_CASH_IN` | int (one-hot) |
+| 8 | `type_CASH_OUT` | int (one-hot) |
+| 9 | `type_DEBIT` | int (one-hot) |
+| 10 | `type_PAYMENT` | int (one-hot) |
+| 11 | `type_TRANSFER` | int (one-hot) |
 
 ---
 
 ## IAM Role & Policy Requirements
 
-This project requires the following IAM roles and permission policies to be configured in the AWS Console before running. All policies are attached directly via **IAM → Roles → Attach policies** or **IAM → Users → Add permissions**.
+Configure the following IAM roles in the AWS Console before running the project.
 
-### 1. Local Ubuntu Machine — IAM User
+### 1. Local Machine — IAM User
 
-The machine running `offline_transaction.py` and `stream_transactions.py` must be configured via AWS CLI (`aws configure`). In the AWS Console, go to **IAM → Users → your user → Add permissions → Attach policies directly** and attach the following AWS managed policies:
+Go to **IAM → Users → your user → Add permissions → Attach policies directly**:
 
 | Managed Policy | Purpose |
 |---|---|
@@ -84,17 +117,17 @@ The machine running `offline_transaction.py` and `stream_transactions.py` must b
 
 ### 2. SageMaker Execution Role
 
-In the AWS Console, go to **IAM → Roles → Create role → AWS service → SageMaker**, then attach the following managed policies:
+Go to **IAM → Roles → Create role → AWS service → SageMaker**:
 
 | Managed Policy | Purpose |
 |---|---|
 | `AmazonSageMakerFullAccess` | Training, model, and endpoint management |
-| `AmazonS3FullAccess` | Read raw data from S3, write model artifacts |
+| `AmazonS3FullAccess` | Read raw/processed data, write model artifacts |
 | `CloudWatchLogsFullAccess` | Write training logs to CloudWatch |
 
 ### 3. Lambda Execution Role
 
-In the AWS Console, go to **IAM → Roles → Create role → AWS service → Lambda**, then attach the following managed policies:
+Go to **IAM → Roles → Create role → AWS service → Lambda**:
 
 | Managed Policy | Purpose |
 |---|---|
@@ -105,7 +138,7 @@ In the AWS Console, go to **IAM → Roles → Create role → AWS service → La
 
 ### 4. CloudWatch & SNS
 
-In the AWS Console, go to **IAM → Roles → your CloudWatch role → Add permissions → Attach policies directly** and attach:
+Go to **IAM → Roles → your CloudWatch role → Add permissions**:
 
 | Managed Policy | Purpose |
 |---|---|
@@ -120,11 +153,18 @@ In the AWS Console, go to **IAM → Roles → your CloudWatch role → Add permi
 
 ```
 finalproject-fraud-detection/
-├── raw/                  # Raw generated transaction CSV files
-├── processed/            # Cleaned / feature-engineered data
-├── predictions/          # Lambda inference output (fraud scores)
-├── model/                # Trained SageMaker XGBoost model artifacts
-└── Athena-results/       # Athena query output files
+├── raw/                        # Source dataset CSV
+├── processed/
+│   ├── train/                  # Training split (70%)
+│   ├── validation/             # Validation split (15%)
+│   └── test/                   # Test split (15%)
+├── predictions/
+│   ├── realtime/               # Per-transaction Lambda inference output (JSON)
+│   └── offline-endpoint-check/ # Endpoint verification results (CSV)
+├── model/
+│   ├── training-output/        # SageMaker training job output
+│   └── xgboost/                # Copied model artifact (model.tar.gz)
+└── Athena-results/             # Athena query output files
 ```
 
 ---
@@ -133,15 +173,16 @@ finalproject-fraud-detection/
 
 ```
 AWS-Fraud-Detection-Analysis/
-├── architecture/         # AWS architecture diagrams
-├── dashboard/            # QuickSight exported visualizations
-├── dataset/              # Offline-generated transaction datasets
-├── lambda/               # Lambda function source code
-├── model/                # Offline-trained model artifacts
-├── sql/                  # Athena SQL query scripts
+├── architecture/                         # AWS architecture diagrams
+├── dashboard/                            # QuickSight exported visualizations
+├── dataset/                              # Offline-generated transaction datasets
+├── lambda/
+│   └── fraud_detection_lambda.py         # Lambda handler: decode → feature build → batch infer → S3 write
+├── model/                                # Offline-trained model artifacts
+├── sql/                                  # Athena SQL query scripts
 ├── src/
-│   ├── offline_transaction.py    # Synthetic dataset generation & S3 upload
-│   └── stream_transactions.py   # Real-time Kinesis stream simulator
+│   └── stream_transactions.py            # Balanced pool builder & Kinesis stream simulator
+├── Training Model and Deploy.ipynb       # SageMaker training, evaluation, and deployment notebook
 ├── README.md
 └── requirements.txt
 ```
@@ -154,7 +195,7 @@ AWS-Fraud-Detection-Analysis/
 
 - Ubuntu 24.04
 - Python 3.10+
-- AWS CLI configured with appropriate IAM permissions
+- AWS CLI configured (`aws configure`) with IAM user credentials
 - AWS services enabled: Kinesis, SageMaker, Lambda, S3, Athena, QuickSight, CloudWatch, SNS
 
 ### Installation
@@ -167,37 +208,73 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 1 — Generate Dataset & Train Model (Offline)
+### Step 1 — Upload Dataset to S3
+
+Upload the raw dataset to S3 before running the notebook:
 
 ```bash
-python3 src/offline_transaction.py
+aws s3 cp dataset/PS_20174392719_1491204439457_log.csv \
+    s3://finalproject-fraud-detection/raw/
 ```
 
-This script generates a synthetic transaction dataset, uploads it to `s3://finalproject-fraud-detection/raw/`, and triggers SageMaker XGBoost training. The trained model artifact is saved to `s3://finalproject-fraud-detection/model/`.
+### Step 2 — Train Model (SageMaker Notebook)
 
-### Step 2 — Deploy SageMaker Endpoint
+Open and run `Training Model and Deploy.ipynb` in a SageMaker Notebook instance. The notebook will:
 
-Deploy the trained model as a real-time SageMaker inference endpoint via the AWS Console or SageMaker SDK.
+1. Download the raw CSV from `S3 (raw/)` and preprocess it with chunk-based reading
+2. One-hot encode transaction types and downsample non-fraud records (3% sample)
+3. Split into train / validation / test and upload to `S3 (processed/)`
+4. Launch a SageMaker XGBoost training job on `ml.m5.large`
+5. Evaluate the model on the test set (ROC-AUC ≈ 0.9992)
 
-### Step 3 — Start Real-Time Stream
+### Step 3 — Deploy SageMaker Endpoint
+
+Continue in `Training Model and Deploy.ipynb` to deploy the trained model:
+
+```python
+predictor = xgb.deploy(
+    initial_instance_count=1,
+    instance_type="ml.m5.large",
+    serializer=CSVSerializer(),
+    deserializer=JSONDeserializer()
+)
+```
+
+Note the deployed endpoint name (e.g. `sagemaker-xgboost-2026-03-13-23-05-26-528`) for use in the Lambda configuration.
+
+### Step 4 — Configure Lambda Function
+
+1. In the AWS Console, create a Lambda function using the code in `lambda/fraud_detection_lambda.py`
+2. Set the following environment variables:
+
+| Key | Value |
+|---|---|
+| `ENDPOINT_NAME` | Your deployed SageMaker endpoint name |
+| `PREDICTION_BUCKET` | `finalproject-fraud-detection` |
+| `PREDICTION_PREFIX` | `predictions/realtime` |
+
+3. Add a Kinesis trigger pointing to `fraud-stream`
+4. Attach the Lambda execution role defined in the IAM section above
+
+### Step 5 — Start Real-Time Stream
 
 ```bash
 python3 src/stream_transactions.py
 ```
 
-This script streams simulated transactions to the Kinesis `fraud-stream`. Lambda automatically invokes the SageMaker endpoint for each record and writes predictions to `s3://finalproject-fraud-detection/predictions/`.
+This script reads the raw CSV from S3, builds a balanced pool (20% fraud, 80% normal by default), and streams 1,500 transactions to `fraud-stream`. Lambda processes each batch, invokes the SageMaker endpoint, and writes per-transaction JSON results to `s3://finalproject-fraud-detection/predictions/realtime/`.
 
-### Step 4 — Query Results with Athena
+### Step 6 — Query Results with Athena
 
-Run the SQL scripts in `sql/` against the predictions bucket to analyze fraud patterns. Athena query results are saved to `s3://finalproject-fraud-detection/Athena-results/`.
+Run the SQL scripts in `sql/` against the predictions bucket. Results are saved to `s3://finalproject-fraud-detection/Athena-results/`.
 
-### Step 5 — Visualize with QuickSight
+### Step 7 — Visualize with QuickSight
 
 Connect QuickSight to the Athena data source and load the dashboard configurations from `dashboard/` to explore fraud metrics interactively.
 
-### Step 6 — Monitor with CloudWatch & SNS
+### Step 8 — Monitor with CloudWatch & SNS
 
-CloudWatch monitors Lambda invocations, stream throughput, and fraud rate metrics. An alarm triggers an SNS notification when the fraud rate exceeds the configured threshold.
+CloudWatch collects Lambda execution logs, Kinesis stream throughput, and SageMaker endpoint invocation metrics. Configure an alarm to trigger an SNS notification to `fraud-alert-topic` when the fraud rate exceeds your defined threshold.
 
 ---
 

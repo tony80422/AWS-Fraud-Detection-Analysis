@@ -9,6 +9,9 @@ joblib>=1.3.0
 boto3>=1.34.0
 botocore>=1.34.0
 
+# ── SageMaker SDK (Training & Deployment) ────────────────────────
+sagemaker>=2.210.0
+
 # ── Offline Data Generation ──────────────────────────────────────
 faker>=24.0.0
 

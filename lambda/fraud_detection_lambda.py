@@ -1,96 +1,120 @@
-import json
 import os
+import json
 import base64
 import boto3
-import logging
 from datetime import datetime
 
+# AWS clients
 runtime = boto3.client("sagemaker-runtime")
 s3 = boto3.client("s3")
-cloudwatch = boto3.client("cloudwatch")
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# Environment variables
+ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "sagemaker-xgboost-2026-03-13-23-05-26-528")
+PREDICTION_BUCKET = os.environ.get("PREDICTION_BUCKET", "finalproject-fraud-detection")
+PREDICTION_PREFIX = os.environ.get("PREDICTION_PREFIX", "predictions/realtime")
 
-BUCKET = os.environ["BUCKET_NAME"]
-ENDPOINT_NAME = os.environ["ENDPOINT_NAME"]
-PREDICTION_PREFIX = os.environ.get("PREDICTION_PREFIX", "predictions/")
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
 
-MERCHANT_MAP = {
-    "Amazon": 0, "Walmart": 1, "Apple Store": 2, "Best Buy": 3,
-    "Target": 4, "Starbucks": 5, "eBay": 6, "Uber": 7, "Netflix": 8
-}
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
-LOCATION_MAP = {
-    "New York": 0, "Boston": 1, "San Francisco": 2, "Chicago": 3,
-    "Los Angeles": 4, "Seattle": 5, "Dallas": 6, "Miami": 7
-}
+def build_feature_vector(record):
+    """
+    Build the feature vector in the exact same order as the offline training data.
 
-PAYMENT_MAP = {
-    "Credit Card": 0, "Debit Card": 1, "Online Payment": 2, "Mobile Pay": 3
-}
+    Feature order:
+    step, amount, oldbalanceOrg, newbalanceOrig, oldbalanceDest, newbalanceDest,
+    type_CASH_IN, type_CASH_OUT, type_DEBIT, type_PAYMENT, type_TRANSFER
+    """
+    txn_type = str(record.get("type", "")).upper()
 
-def put_custom_metrics(prediction_score, fraud_flag):
-    cloudwatch.put_metric_data(
-        Namespace="FraudDetection",
-        MetricData=[
-            {
-                "MetricName": "PredictionScore",
-                "Dimensions": [
-                    {"Name": "Environment", "Value": "Prod"},
-                    {"Name": "ModelEndpoint", "Value": ENDPOINT_NAME}
-                ],
-                "Value": float(prediction_score),
-                "Unit": "None"
-            },
-            {
-                "MetricName": "FraudCount",
-                "Dimensions": [
-                    {"Name": "Environment", "Value": "Prod"},
-                    {"Name": "ModelEndpoint", "Value": ENDPOINT_NAME}
-                ],
-                "Value": int(fraud_flag),
-                "Unit": "Count"
-            },
-            {
-                "MetricName": "PredictionCount",
-                "Dimensions": [
-                    {"Name": "Environment", "Value": "Prod"},
-                    {"Name": "ModelEndpoint", "Value": ENDPOINT_NAME}
-                ],
-                "Value": 1,
-                "Unit": "Count"
-            }
-        ]
-    )
-    logger.info("CloudWatch metrics published successfully")
-
-def encode_transaction(tx):
-    ts = datetime.fromisoformat(tx["timestamp"].replace("Z", ""))
-
-    merchant_enc = MERCHANT_MAP.get(tx["merchant"], -1)
-    location_enc = LOCATION_MAP.get(tx["location"], -1)
-    payment_enc = PAYMENT_MAP.get(tx["payment_method"], -1)
-
-    if -1 in [merchant_enc, location_enc, payment_enc]:
-        raise ValueError(
-            f"Unknown categorical value: merchant={tx.get('merchant')}, "
-            f"location={tx.get('location')}, payment_method={tx.get('payment_method')}"
-        )
+    type_cash_in = 1 if txn_type == "CASH_IN" else 0
+    type_cash_out = 1 if txn_type == "CASH_OUT" else 0
+    type_debit = 1 if txn_type == "DEBIT" else 0
+    type_payment = 1 if txn_type == "PAYMENT" else 0
+    type_transfer = 1 if txn_type == "TRANSFER" else 0
 
     return [
-        float(tx["amount"]),
-        ts.hour,
-        ts.day,
-        ts.month,
-        merchant_enc,
-        location_enc,
-        payment_enc
+        safe_int(record.get("step", 0)),
+        safe_float(record.get("amount", 0.0)),
+        safe_float(record.get("oldbalanceOrg", 0.0)),
+        safe_float(record.get("newbalanceOrig", 0.0)),
+        safe_float(record.get("oldbalanceDest", 0.0)),
+        safe_float(record.get("newbalanceDest", 0.0)),
+        type_cash_in,
+        type_cash_out,
+        type_debit,
+        type_payment,
+        type_transfer,
     ]
 
-def invoke_model(features):
-    payload = ",".join(map(str, features))
-    logger.info("Invoking endpoint %s with payload: %s", ENDPOINT_NAME, payload)
+def build_csv_payload(feature_rows):
+    """
+    Convert multiple feature rows into one multi-line CSV payload.
+    One row = one inference sample.
+    """
+    return "\n".join(
+        ",".join(map(str, row))
+        for row in feature_rows
+    )
+
+def parse_batch_prediction_result(result_text):
+    """
+    Parse SageMaker endpoint batch inference response.
+
+    Supported formats:
+    1. Plain float for a single row: "0.12345"
+    2. Newline-separated floats:
+       0.123
+       0.456
+    3. Comma-separated floats: "0.123,0.456"
+    4. JSON format:
+       {"predictions":[{"score":0.123},{"score":0.456}]}
+       or {"predictions":[0.123,0.456]}
+    """
+    result_text = result_text.strip()
+
+    if not result_text:
+        return []
+
+    # Try JSON first
+    try:
+        parsed = json.loads(result_text)
+        if isinstance(parsed, dict) and "predictions" in parsed:
+            predictions = parsed["predictions"]
+            scores = []
+            for item in predictions:
+                if isinstance(item, dict) and "score" in item:
+                    scores.append(float(item["score"]))
+                else:
+                    scores.append(float(item))
+            return scores
+    except Exception:
+        pass
+
+    # Newline-separated scores
+    if "\n" in result_text:
+        return [float(x.strip()) for x in result_text.split("\n") if x.strip()]
+
+    # Comma-separated scores
+    if "," in result_text:
+        return [float(x.strip()) for x in result_text.split(",") if x.strip()]
+
+    # Single score
+    return [float(result_text)]
+
+def invoke_endpoint_batch(feature_rows):
+    """
+    Invoke the SageMaker endpoint once for a batch of records.
+    """
+    payload = build_csv_payload(feature_rows)
 
     response = runtime.invoke_endpoint(
         EndpointName=ENDPOINT_NAME,
@@ -98,102 +122,127 @@ def invoke_model(features):
         Body=payload
     )
 
-    result = response["Body"].read().decode("utf-8").strip()
-    logger.info("Raw model response: %s", result)
-    return result
+    result_text = response["Body"].read().decode("utf-8").strip()
+    scores = parse_batch_prediction_result(result_text)
 
-def parse_prediction(prediction_result):
-    try:
-        data = json.loads(prediction_result)
-    except json.JSONDecodeError:
-        return float(prediction_result)
+    return scores, payload
 
-    if isinstance(data, (int, float)):
-        return float(data)
-
-    if isinstance(data, list) and len(data) > 0:
-        return float(data[0])
-
-    if isinstance(data, dict):
-        if "predictions" in data:
-            preds = data["predictions"]
-            if isinstance(preds, list) and len(preds) > 0:
-                first = preds[0]
-                if isinstance(first, dict) and "score" in first:
-                    return float(first["score"])
-                return float(first)
-        if "score" in data:
-            return float(data["score"])
-
-    raise ValueError(f"Unsupported prediction format: {prediction_result}")
-
-def save_prediction(original_tx, prediction_score, fraud_flag):
-    if not PREDICTION_PREFIX.endswith("/"):
-        prefix = PREDICTION_PREFIX + "/"
-    else:
-        prefix = PREDICTION_PREFIX
-
-    timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    key = f"{prefix}prediction-{timestamp_str}.json"
-
-    output = {
-        "transaction_id": original_tx["transaction_id"],
-        "timestamp": original_tx["timestamp"],
-        "amount": original_tx["amount"],
-        "merchant": original_tx["merchant"],
-        "location": original_tx["location"],
-        "payment_method": original_tx["payment_method"],
-        "actual_fraud": original_tx.get("fraud"),
-        "prediction_score": prediction_score,
-        "predicted_fraud": fraud_flag
-    }
+def save_prediction_result(output_record):
+    """
+    Save one prediction result to S3 in JSON format.
+    """
+    now = datetime.utcnow()
+    s3_key = (
+        f"{PREDICTION_PREFIX}/"
+        f"year={now.year}/month={now.month:02d}/day={now.day:02d}/"
+        f"{output_record['transaction_id']}.json"
+    )
 
     s3.put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=json.dumps(output),
+        Bucket=PREDICTION_BUCKET,
+        Key=s3_key,
+        Body=json.dumps(output_record).encode("utf-8"),
         ContentType="application/json"
     )
 
-    logger.info("Saved prediction to s3://%s/%s", BUCKET, key)
-    return key
+    return s3_key
 
 def lambda_handler(event, context):
-    logger.info("Received event: %s", json.dumps(event))
+    valid_records = []
+    feature_rows = []
+    decode_errors = []
 
-    results = []
-    failures = []
-
-    for record in event.get("Records", []):
-        sequence_number = record.get("kinesis", {}).get("sequenceNumber")
+    # Step 1: Decode Kinesis records and build features
+    for item in event.get("Records", []):
         try:
-            payload = base64.b64decode(record["kinesis"]["data"]).decode("utf-8")
-            logger.info("Decoded payload: %s", payload)
+            raw_data = base64.b64decode(item["kinesis"]["data"]).decode("utf-8")
+            record = json.loads(raw_data)
+            features = build_feature_vector(record)
 
-            tx = json.loads(payload)
-            features = encode_transaction(tx)
-            prediction_result = invoke_model(features)
-            prediction_score = parse_prediction(prediction_result)
-            fraud_flag = 1 if prediction_score > 0.8 else 0
-
-            put_custom_metrics(prediction_score, fraud_flag)
-            s3_key = save_prediction(tx, prediction_score, fraud_flag)
-
-            results.append({
-                "transaction_id": tx["transaction_id"],
-                "prediction_score": prediction_score,
-                "predicted_fraud": fraud_flag,
-                "s3_key": s3_key
-            })
+            valid_records.append(record)
+            feature_rows.append(features)
 
         except Exception as e:
-            logger.error("Failed record sequence=%s error=%s", sequence_number, str(e), exc_info=True)
-            if sequence_number:
-                failures.append({"itemIdentifier": sequence_number})
+            decode_errors.append({
+                "error": f"decode_or_feature_error: {str(e)}"
+            })
 
-    logger.info("Processed results: %s", json.dumps(results))
-    logger.info("Failures: %s", json.dumps(failures))
+    # No valid records
+    if not valid_records:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "No valid records to process",
+                "errors": decode_errors
+            })
+        }
+
+    # Step 2: Invoke endpoint once for the whole batch
+    try:
+        scores, batch_payload = invoke_endpoint_batch(feature_rows)
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "message": "Endpoint batch invocation failed",
+                "error": str(e),
+                "record_count": len(valid_records)
+            })
+        }
+
+    # Step 3: Validate returned score count
+    if len(scores) != len(valid_records):
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "message": "Prediction count does not match input count",
+                "input_count": len(valid_records),
+                "prediction_count": len(scores)
+            })
+        }
+
+    # Step 4: Save each prediction result
+    results = []
+
+    for record, features, score in zip(valid_records, feature_rows, scores):
+        predicted_label = 1 if float(score) >= 0.5 else 0
+        endpoint_payload = ",".join(map(str, features))
+
+        output_record = {
+            "transaction_id": record.get("transaction_id"),
+            "timestamp": record.get("timestamp"),
+            "location": record.get("location"),
+            "feature_version": record.get("feature_version", "v1"),
+            "type": record.get("type"),
+            "step": record.get("step"),
+            "amount": record.get("amount"),
+            "oldbalanceOrg": record.get("oldbalanceOrg"),
+            "newbalanceOrig": record.get("newbalanceOrig"),
+            "oldbalanceDest": record.get("oldbalanceDest"),
+            "newbalanceDest": record.get("newbalanceDest"),
+            "actual_isFraud": record.get("actual_isFraud"),
+            "predicted_score": float(score),
+            "predicted_label": predicted_label,
+            "threshold": 0.5,
+            "endpoint_name": ENDPOINT_NAME,
+            "endpoint_payload": endpoint_payload,
+            "processed_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+        s3_key = save_prediction_result(output_record)
+
+        results.append({
+            "transaction_id": output_record["transaction_id"],
+            "predicted_score": float(score),
+            "predicted_label": predicted_label,
+            "s3_key": s3_key
+        })
 
     return {
-        "batchItemFailures": failures
+        "statusCode": 200,
+        "body": json.dumps({
+            "processed_count": len(results),
+            "errors": decode_errors,
+            "results": results
+        })
     }
