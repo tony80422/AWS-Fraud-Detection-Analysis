@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import uuid
 import boto3
 from datetime import datetime
 
@@ -12,6 +13,10 @@ s3 = boto3.client("s3")
 ENDPOINT_NAME = os.environ.get("ENDPOINT_NAME", "sagemaker-xgboost-2026-03-13-23-05-26-528")
 PREDICTION_BUCKET = os.environ.get("PREDICTION_BUCKET", "finalproject-fraud-detection")
 PREDICTION_PREFIX = os.environ.get("PREDICTION_PREFIX", "predictions/realtime")
+ENDPOINT_BATCH_SIZE = int(os.environ.get("ENDPOINT_BATCH_SIZE", "500"))
+SAVE_ONE_FILE_PER_BATCH = os.environ.get("SAVE_ONE_FILE_PER_BATCH", "true").lower() == "true"
+THRESHOLD = float(os.environ.get("THRESHOLD", "0.5"))
+
 
 def safe_float(value, default=0.0):
     try:
@@ -19,11 +24,18 @@ def safe_float(value, default=0.0):
     except Exception:
         return default
 
+
 def safe_int(value, default=0):
     try:
         return int(value)
     except Exception:
         return default
+
+
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
 
 def build_feature_vector(record):
     """
@@ -55,36 +67,20 @@ def build_feature_vector(record):
         type_transfer,
     ]
 
+
 def build_csv_payload(feature_rows):
-    """
-    Convert multiple feature rows into one multi-line CSV payload.
-    One row = one inference sample.
-    """
     return "\n".join(
         ",".join(map(str, row))
         for row in feature_rows
     )
 
-def parse_batch_prediction_result(result_text):
-    """
-    Parse SageMaker endpoint batch inference response.
 
-    Supported formats:
-    1. Plain float for a single row: "0.12345"
-    2. Newline-separated floats:
-       0.123
-       0.456
-    3. Comma-separated floats: "0.123,0.456"
-    4. JSON format:
-       {"predictions":[{"score":0.123},{"score":0.456}]}
-       or {"predictions":[0.123,0.456]}
-    """
+def parse_batch_prediction_result(result_text):
     result_text = result_text.strip()
 
     if not result_text:
         return []
 
-    # Try JSON first
     try:
         parsed = json.loads(result_text)
         if isinstance(parsed, dict) and "predictions" in parsed:
@@ -99,21 +95,16 @@ def parse_batch_prediction_result(result_text):
     except Exception:
         pass
 
-    # Newline-separated scores
     if "\n" in result_text:
         return [float(x.strip()) for x in result_text.split("\n") if x.strip()]
 
-    # Comma-separated scores
     if "," in result_text:
         return [float(x.strip()) for x in result_text.split(",") if x.strip()]
 
-    # Single score
     return [float(result_text)]
 
+
 def invoke_endpoint_batch(feature_rows):
-    """
-    Invoke the SageMaker endpoint once for a batch of records.
-    """
     payload = build_csv_payload(feature_rows)
 
     response = runtime.invoke_endpoint(
@@ -125,12 +116,31 @@ def invoke_endpoint_batch(feature_rows):
     result_text = response["Body"].read().decode("utf-8").strip()
     scores = parse_batch_prediction_result(result_text)
 
-    return scores, payload
+    return scores
+
+
+def save_batch_prediction_results(output_records):
+    now = datetime.utcnow()
+    file_id = uuid.uuid4().hex
+    s3_key = (
+        f"{PREDICTION_PREFIX}/"
+        f"year={now.year}/month={now.month:02d}/day={now.day:02d}/"
+        f"batch_{now.strftime('%Y%m%dT%H%M%S')}_{file_id}.jsonl"
+    )
+
+    body = "\n".join(json.dumps(record) for record in output_records)
+
+    s3.put_object(
+        Bucket=PREDICTION_BUCKET,
+        Key=s3_key,
+        Body=body.encode("utf-8"),
+        ContentType="application/json"
+    )
+
+    return s3_key
+
 
 def save_prediction_result(output_record):
-    """
-    Save one prediction result to S3 in JSON format.
-    """
     now = datetime.utcnow()
     s3_key = (
         f"{PREDICTION_PREFIX}/"
@@ -147,27 +157,22 @@ def save_prediction_result(output_record):
 
     return s3_key
 
+
 def lambda_handler(event, context):
     valid_records = []
-    feature_rows = []
     decode_errors = []
 
-    # Step 1: Decode Kinesis records and build features
+    # Step 1: Decode Kinesis records
     for item in event.get("Records", []):
         try:
             raw_data = base64.b64decode(item["kinesis"]["data"]).decode("utf-8")
             record = json.loads(raw_data)
-            features = build_feature_vector(record)
-
             valid_records.append(record)
-            feature_rows.append(features)
-
         except Exception as e:
             decode_errors.append({
-                "error": f"decode_or_feature_error: {str(e)}"
+                "error": f"decode_or_parse_error: {str(e)}"
             })
 
-    # No valid records
     if not valid_records:
         return {
             "statusCode": 200,
@@ -177,72 +182,95 @@ def lambda_handler(event, context):
             })
         }
 
-    # Step 2: Invoke endpoint once for the whole batch
-    try:
-        scores, batch_payload = invoke_endpoint_batch(feature_rows)
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "message": "Endpoint batch invocation failed",
-                "error": str(e),
-                "record_count": len(valid_records)
-            })
-        }
+    all_results = []
+    batch_s3_keys = []
 
-    # Step 3: Validate returned score count
-    if len(scores) != len(valid_records):
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "message": "Prediction count does not match input count",
-                "input_count": len(valid_records),
-                "prediction_count": len(scores)
-            })
-        }
+    # Step 2: Invoke endpoint in batches inside one Lambda execution
+    for batch_number, record_batch in enumerate(chunked(valid_records, ENDPOINT_BATCH_SIZE), start=1):
+        feature_rows = [build_feature_vector(record) for record in record_batch]
 
-    # Step 4: Save each prediction result
-    results = []
+        try:
+            scores = invoke_endpoint_batch(feature_rows)
+        except Exception as e:
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "message": "Endpoint batch invocation failed",
+                    "error": str(e),
+                    "batch_number": batch_number,
+                    "record_count": len(record_batch)
+                })
+            }
 
-    for record, features, score in zip(valid_records, feature_rows, scores):
-        predicted_label = 1 if float(score) >= 0.5 else 0
-        endpoint_payload = ",".join(map(str, features))
+        if len(scores) != len(record_batch):
+            return {
+                "statusCode": 500,
+                "body": json.dumps({
+                    "message": "Prediction count does not match input count",
+                    "batch_number": batch_number,
+                    "input_count": len(record_batch),
+                    "prediction_count": len(scores)
+                })
+            }
 
-        output_record = {
-            "transaction_id": record.get("transaction_id"),
-            "timestamp": record.get("timestamp"),
-            "location": record.get("location"),
-            "feature_version": record.get("feature_version", "v1"),
-            "type": record.get("type"),
-            "step": record.get("step"),
-            "amount": record.get("amount"),
-            "oldbalanceOrg": record.get("oldbalanceOrg"),
-            "newbalanceOrig": record.get("newbalanceOrig"),
-            "oldbalanceDest": record.get("oldbalanceDest"),
-            "newbalanceDest": record.get("newbalanceDest"),
-            "actual_isFraud": record.get("actual_isFraud"),
-            "predicted_score": float(score),
-            "predicted_label": predicted_label,
-            "threshold": 0.5,
-            "endpoint_name": ENDPOINT_NAME,
-            "endpoint_payload": endpoint_payload,
-            "processed_at": datetime.utcnow().isoformat() + "Z"
-        }
+        output_records = []
 
-        s3_key = save_prediction_result(output_record)
+        for record, features, score in zip(record_batch, feature_rows, scores):
+            predicted_label = 1 if float(score) >= THRESHOLD else 0
+            endpoint_payload = ",".join(map(str, features))
 
-        results.append({
-            "transaction_id": output_record["transaction_id"],
-            "predicted_score": float(score),
-            "predicted_label": predicted_label,
-            "s3_key": s3_key
-        })
+            output_record = {
+                "transaction_id": record.get("transaction_id"),
+                "timestamp": record.get("timestamp"),
+                "location": record.get("location"),
+                "feature_version": record.get("feature_version", "v1"),
+                "type": record.get("type"),
+                "step": record.get("step"),
+                "amount": record.get("amount"),
+                "oldbalanceOrg": record.get("oldbalanceOrg"),
+                "newbalanceOrig": record.get("newbalanceOrig"),
+                "oldbalanceDest": record.get("oldbalanceDest"),
+                "newbalanceDest": record.get("newbalanceDest"),
+                "actual_isFraud": record.get("actual_isFraud"),
+                "predicted_score": float(score),
+                "predicted_label": predicted_label,
+                "threshold": THRESHOLD,
+                "endpoint_name": ENDPOINT_NAME,
+                "endpoint_payload": endpoint_payload,
+                "processed_at": datetime.utcnow().isoformat() + "Z"
+            }
+            output_records.append(output_record)
+
+        # Step 3: Save results to S3
+        if SAVE_ONE_FILE_PER_BATCH:
+            batch_s3_key = save_batch_prediction_results(output_records)
+            batch_s3_keys.append(batch_s3_key)
+
+            for output_record in output_records:
+                all_results.append({
+                    "transaction_id": output_record["transaction_id"],
+                    "predicted_score": output_record["predicted_score"],
+                    "predicted_label": output_record["predicted_label"],
+                    "s3_key": batch_s3_key
+                })
+        else:
+            for output_record in output_records:
+                s3_key = save_prediction_result(output_record)
+                all_results.append({
+                    "transaction_id": output_record["transaction_id"],
+                    "predicted_score": output_record["predicted_score"],
+                    "predicted_label": output_record["predicted_label"],
+                    "s3_key": s3_key
+                })
 
     return {
         "statusCode": 200,
         "body": json.dumps({
-            "processed_count": len(results),
+            "processed_count": len(all_results),
+            "endpoint_batch_size": ENDPOINT_BATCH_SIZE,
+            "save_one_file_per_batch": SAVE_ONE_FILE_PER_BATCH,
+            "batch_s3_keys": batch_s3_keys,
             "errors": decode_errors,
-            "results": results
+            "results": all_results
         })
     }

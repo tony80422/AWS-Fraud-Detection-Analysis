@@ -73,7 +73,7 @@ CloudWatch
 
 | Service | Role |
 |---|---|
-| **Amazon Kinesis** | Real-time transaction data ingestion (`fraud-stream`) |
+| **Amazon Kinesis** | Real-time transaction data ingestion (`fraud-stream`); capacity mode: **on-demand**; max capacity: **10,240 KiB** |
 | **AWS Lambda** | Batch inference trigger on each Kinesis shard record |
 | **Amazon SageMaker** | XGBoost model training (`ml.m5.large`) and hosted real-time endpoint |
 | **Amazon S3** | Storage for raw data, processed splits, model artifacts, and predictions |
@@ -267,11 +267,18 @@ Note the deployed endpoint name (e.g. `sagemaker-xgboost-2026-03-13-23-05-26-528
 | Key | Value |
 |---|---|
 | `ENDPOINT_NAME` | Your deployed SageMaker endpoint name |
-| `PREDICTION_BUCKET` | `finalproject-fraud-detection` |
+| `PREDICTION_BUCKET` | Your Bucket Name |
 | `PREDICTION_PREFIX` | `predictions/realtime` |
 
-3. Add a Kinesis trigger pointing to `fraud-stream`
-4. Attach the Lambda execution role defined in the IAM section above
+3. Configure the following Lambda resource settings:
+
+| Setting | Value |
+|---|---|
+| **Memory** | 1024 MB |
+| **Timeout** | 5 minutes (300 seconds) |
+
+4. Add a Kinesis trigger pointing to `fraud-stream`
+5. Attach the Lambda execution role defined in the IAM section above
 
 ### Step 5 — Start Real-Time Stream
 
