@@ -302,7 +302,7 @@ Connect QuickSight to the Athena data source and load the dashboard configuratio
 
 ### Step 8 — Monitor with CloudWatch & SNS
 
-CloudWatch collects Lambda execution logs, Kinesis stream throughput, and SageMaker endpoint invocation metrics. Configure an alarm to trigger an SNS notification to `fraud-alert-topic` when the fraud rate exceeds your defined threshold.
+CloudWatch collects Lambda execution logs, Kinesis stream throughput, and SageMaker endpoint invocation metrics. Configure an alarm to trigger an SNS notification to `fraud-alert` when the fraud rate exceeds your defined threshold.
 
 ---
 
