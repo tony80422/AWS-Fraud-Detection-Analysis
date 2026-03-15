@@ -31,7 +31,7 @@ MAX_NORMAL_POOL = 120000             # Normal source pool kept in memory
 SHUFFLE_RECORDS = True
 SEND_DELAY_SECONDS = 0.2             # Send delay every 0.2 seconds
 KINESIS_BATCH_SIZE = 200             # Kinesis put_records max = 200
-PRINT_EVERY_BATCHES = 20             # Print progress every N batches
+PRINT_EVERY_BATCHES = 20             # Print progress every 20 batches
 
 # =========================
 # Location distribution
