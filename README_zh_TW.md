@@ -38,6 +38,8 @@ aws s3 cp s3://finalproject-fraud-detection/raw/PS_20174392719_1491204439457_log
 
 ## 架構
 
+ ![AWS Fraud Detection Architecture](architecture/aws-fraud-detection-architecture.png)
+
 ### 離線流水線（模型訓練）
 
 ```
