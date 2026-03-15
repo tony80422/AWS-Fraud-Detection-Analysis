@@ -38,6 +38,8 @@ aws s3 cp s3://finalproject-fraud-detection/raw/PS_20174392719_1491204439457_log
 
 ## Architecture
 
+ ![AWS Fraud Detection Architecture](architecture/aws-fraud-detection-architecture.png)
+ 
 ### Offline Pipeline (Model Training)
 
 ```
