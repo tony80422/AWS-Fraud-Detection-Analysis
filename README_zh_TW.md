@@ -302,7 +302,7 @@ python3 src/stream_transactions.py
 
 ### 第八步 — 使用 CloudWatch 與 SNS 監控
 
-CloudWatch 收集 Lambda 執行日誌、Kinesis 串流吞吐量及 SageMaker 端點呼叫指標。設定告警，當詐欺率超過定義閾值時，向 `fraud-alert-topic` 觸發 SNS 通知。
+CloudWatch 收集 Lambda 執行日誌、Kinesis 串流吞吐量及 SageMaker 端點呼叫指標。設定告警，當詐欺率超過定義閾值時，向 `fraud-alert` 觸發 SNS 通知。
 
 ---
 
